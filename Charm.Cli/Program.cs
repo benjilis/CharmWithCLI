@@ -3,13 +3,21 @@ using Newtonsoft.Json;
 using Tiger;
 using Tiger.Schema;
 using Tiger.Schema.Activity;
+using Tiger.Schema.Investment;
+using Tiger.Exporters;
+using Tiger.Schema.Entity;
 
 namespace Charm.Cli;
 
 internal static class Program
 {
+    public static TextWriter Out = null!;
+
     private static int Main(string[] argv)
     {
+        // Tiger logs go to stderr; stdout carries only command results.
+        Out = new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true };
+        Console.SetOut(Console.Error);
         var opts = new Options(argv);
         if (opts.Command == null || opts.Has("help"))
         {
@@ -26,6 +34,9 @@ internal static class Program
             {
                 case "activities": return Commands.Activities(opts);
                 case "bubbles": return Commands.Bubbles(opts);
+                case "export-map": return Commands.ExportMap(opts);
+                case "find-item": return Commands.FindItem(opts);
+                case "export-item": return Commands.ExportItem(opts);
                 default:
                     Console.Error.WriteLine($"Unknown command '{opts.Command}'.");
                     Console.Error.WriteLine(Usage);
@@ -43,6 +54,9 @@ internal static class Program
 
 Commands:
   activities [filter]     list activities (hash, name); filter = case-insensitive substring
+  export-map <bubble hash> [--name <folder>]  export the static meshes of a zone (FBX, textures, info.cfg) to <out>/Maps/<folder>
+  find-item <name>        search inventory items by name substring (or hash)
+  export-item <hash|name> [--animations]  export an item (model, textures, materials, optional animations)
   bubbles <activity>      list the bubbles (zones) of an activity (hash or name substring)
 
 Strategies: see the TigerStrategy enum (DESTINY1_RISE_OF_IRON, DESTINY2_LATEST, ...)";
@@ -195,7 +209,7 @@ internal static class Commands
         int n = 0;
         foreach (var r in rows)
         {
-            Console.WriteLine($"{r.Hash}\t{r.Name}");
+            Program.Out.WriteLine($"{r.Hash}\t{r.Name}");
             n++;
         }
         Console.Error.WriteLine($"{n} activities");
@@ -225,10 +239,129 @@ internal static class Commands
         int n = 0;
         foreach (Bubble b in activity.EnumerateBubbles())
         {
-            Console.WriteLine($"{b.ChildMapReference.Hash}\t{b.Name}");
+            Program.Out.WriteLine($"{b.ChildMapReference.Hash}\t{b.Name}");
             n++;
         }
         Console.Error.WriteLine($"{n} bubbles");
         return 0;
+    }
+
+    static IEnumerable<InventoryItem> Items()
+    {
+        Investment.LazyInit();
+        var all = Investment.Get().GetInventoryItemsUnloaded().ToList();
+        Parallel.ForEach(all, i => { try { i.Load(); } catch { } });
+        return all;
+    }
+
+    public static int FindItem(Options o)
+    {
+        if (o.Positional.Count == 0) { Console.Error.WriteLine("find-item <name>"); return 1; }
+        string q = o.Positional[0];
+        int n = 0;
+        foreach (var i in Items())
+        {
+            string name;
+            try { name = i.Name; } catch { continue; }
+            if (name.Contains(q, StringComparison.OrdinalIgnoreCase) || i.ApiHash.ToString().Equals(q) || i.ApiHash.ToString("X8").Equals(q, StringComparison.OrdinalIgnoreCase))
+            {
+                string type = ""; try { type = i.Type; } catch { }
+                Program.Out.WriteLine($"{i.ApiHash}	{name}	{type}");
+                n++;
+            }
+        }
+        Console.Error.WriteLine($"{n} items");
+        return 0;
+    }
+
+    public static int ExportItem(Options o)
+    {
+        if (o.Positional.Count == 0) { Console.Error.WriteLine("export-item <hash|name> [--animations]"); return 1; }
+        string q = o.Positional[0];
+        var hits = Items().Where(i =>
+        {
+            try { return i.ApiHash.ToString() == q || i.ApiHash.ToString("X8").Equals(q, StringComparison.OrdinalIgnoreCase) || i.Name.Equals(q, StringComparison.OrdinalIgnoreCase); }
+            catch { return false; }
+        }).ToList();
+        if (hits.Count == 0) { Console.Error.WriteLine($"No item '{q}'."); return 1; }
+        if (hits.Count > 1)
+        {
+            Console.Error.WriteLine($"{hits.Count} items match; use a hash:");
+            foreach (var h in hits) Console.Error.WriteLine($"  {h.ApiHash}	{h.Name}");
+            return 1;
+        }
+        var item = hits[0];
+        string save = ConfigSubsystem.Get().GetExportSavePath();
+        if (o.Has("animations")) { /* config flag must be on for weapon animations */ ConfigSubsystem.Get().SetExportAnimations(true); }
+        Investment.Get().ExportInventoryItem(item, save, false, o.Has("animations"));
+        Program.Out.WriteLine(Path.Combine(save, Tiger.Helpers.SanitizeString(item.Name)));
+        return 0;
+    }
+
+    public static int ExportMap(Options o)
+    {
+        if (o.Positional.Count == 0) { Console.Error.WriteLine("export-map <bubble hash>"); return 1; }
+        var hash = new FileHash(o.Positional[0]);
+        var bubble = FileResourcer.Get().GetSchemaTag<SBubbleDefinition>(hash);
+        var containers = new List<FileHash>();
+        foreach (var m in bubble.TagData.MapResources)
+            if (!containers.Contains(m.MapContainer.Hash))
+                containers.Add(m.MapContainer.Hash);
+
+        string folder = o.Get("name") ?? hash.ToString();
+        string savePath = $"{ConfigSubsystem.Get().GetExportSavePath()}/Maps/{folder}/";
+        Exporter.Get().GetOrCreateGlobalScene();
+        foreach (var c in containers)
+        {
+            Console.Error.WriteLine($"Container {c}");
+            ExportFullMap(FileResourcer.Get().GetSchemaTag<SMapContainer>(c), savePath);
+        }
+        Exporter.Get().Export(savePath);
+        Program.Out.WriteLine(savePath);
+        return 0;
+    }
+
+    // Copied from Charm/Activity/MapView.xaml.cs (ExportFullMap / ExtractDataTables), without WPF or progress.
+    static void ExportFullMap(Tag<SMapContainer> map, string savePath)
+    {
+        Directory.CreateDirectory(savePath);
+        ExporterScene staticsScene = Exporter.Get().CreateScene(map.Hash.ToString(), ExportType.Statics, DataExportType.Map);
+        ExporterScene terrainScene = Exporter.Get().CreateScene($"{map.Hash}_Terrain", ExportType.Terrain, DataExportType.Map);
+
+        Parallel.ForEach(map.TagData.MapDataTables, data =>
+        {
+            if (Strategy.IsD1())
+            {
+                if (data.MapDataTable.TagData.DataEntries[0].DataResource.GetValue(data.MapDataTable.GetReader()) is SStaticMapDataResource staticMapResource)
+                {
+                    staticMapResource.StaticMapParent?.Load();
+                    if (staticMapResource.StaticMapParent is null)
+                        return;
+                    staticMapResource.StaticMapParent.TagData.StaticMap.LoadDecalsIntoExporterScene(staticsScene);
+                }
+            }
+
+            data.MapDataTable.TagData.DataEntries.ForEach(entry =>
+            {
+                switch (entry.DataResource.GetValue(data.MapDataTable.GetReader()))
+                {
+                    case SStaticMapDataResource staticMapResource:
+                        staticMapResource.StaticMapParent?.Load();
+                        if (staticMapResource.StaticMapParent is null)
+                            return;
+                        staticMapResource.StaticMapParent.TagData.StaticMap.LoadIntoExporterScene(staticsScene);
+                        break;
+                    case SStaticAOResource AO:
+                        Exporter.Get().GetOrCreateGlobalScene().AddToGlobalScene(AO, true);
+                        break;
+                    case SMapTerrainResource terrain:
+                        terrain.Terrain?.Load();
+                        if (terrain.Terrain is null)
+                            return;
+                        terrain.Terrain.LoadIntoExporter(terrainScene, savePath, terrain.Identifier);
+                        break;
+                }
+            });
+        });
     }
 }
