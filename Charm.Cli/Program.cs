@@ -119,6 +119,7 @@ internal static class Bootstrap
             {
                 CurrentStrategy = strategy,
                 ExportPath = outDir,
+                SaveShaderHLSL = true, // same as the GUI config in use
                 PackagesPath = new Dictionary<TigerStrategy, string> { [strategy] = Path.GetFullPath(game) },
             },
             Unreal = new UnrealSettings(),
@@ -239,7 +240,26 @@ internal static class Commands
         int n = 0;
         foreach (Bubble b in activity.EnumerateBubbles())
         {
-            Program.Out.WriteLine($"{b.ChildMapReference.Hash}\t{b.Name}");
+            string stats = "";
+            try
+            {
+                var def = FileResourcer.Get().GetSchemaTag<SBubbleDefinition>(b.ChildMapReference.Hash);
+                var conts = def.TagData.MapResources.Select(m => m.MapContainer).DistinctBy(c => c.Hash).ToList();
+                int tables = conts.Sum(c => c.TagData.MapDataTables.Count);
+                int statics = 0, instances = 0;
+                foreach (var c in conts)
+                    foreach (var t in c.TagData.MapDataTables)
+                        foreach (var e in t.MapDataTable.TagData.DataEntries)
+                            if (e.DataResource.GetValue(t.MapDataTable.GetReader()) is SStaticMapDataResource r && r.StaticMapParent != null)
+                            {
+                                r.StaticMapParent.Load();
+                                statics++;
+                                instances += r.StaticMapParent.TagData.StaticMap is { } sm ? (sm.TagData.D1StaticMapData != null ? sm.TagData.D1StaticMapData.TagData.InstanceCounts : sm.TagData.Decals.Count) : 0;
+                            }
+                stats = $"\t{conts.Count} containers\t{tables} tables\t{statics} static maps\t{instances} instances";
+            }
+            catch (Exception ex) { stats = $"\tstats failed: {ex.Message}"; }
+            Program.Out.WriteLine($"{b.ChildMapReference.Hash}\t{b.Name}{stats}");
             n++;
         }
         Console.Error.WriteLine($"{n} bubbles");
@@ -317,6 +337,27 @@ internal static class Commands
             ExportFullMap(FileResourcer.Get().GetSchemaTag<SMapContainer>(c), savePath);
         }
         Exporter.Get().Export(savePath);
+
+        // Map resources (entities, sky objects, decorators, speedtrees, decals, lights, cubemaps...), as the UI's "All Map" does.
+        if (!o.Has("no-resources"))
+        {
+            var maps = new Dictionary<FileHash, List<FileHash>>();
+            foreach (var m in bubble.TagData.MapResources)
+            {
+                FileHash ch = m.MapContainer.Hash;
+                if (!maps.ContainsKey(ch)) maps[ch] = new();
+                foreach (SMapDataTableEntry dt in m.MapContainer.TagData.MapDataTables)
+                    if (dt.MapDataTable is not null && !maps[ch].Contains(dt.MapDataTable.Hash))
+                        maps[ch].Add(dt.MapDataTable.Hash);
+            }
+            Exporter.Get().GetOrCreateGlobalScene();
+            foreach (var (container, hashes) in maps)
+            {
+                Console.Error.WriteLine($"Resources {container} ({hashes.Count} tables)");
+                MapEntities.ExportFull(hashes, container.ToString(), savePath);
+            }
+            Exporter.Get().Export(savePath);
+        }
         Program.Out.WriteLine(savePath);
         return 0;
     }
